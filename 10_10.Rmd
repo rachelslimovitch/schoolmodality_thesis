@@ -1,0 +1,197 @@
+---
+title: "Untitled"
+author: "Rachel Slimovitch"
+date: "2023-10-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, tidy.opts=list(width.cutoff=60),tidy=TRUE)
+library(here)
+library(tidyverse)
+library(knitr) # to format tables
+library(lubridate) # to help extract the date
+library(covidcast)
+library(survey)
+library(tableone) # tableone
+library(kableExtra)
+library(magrittr)
+library(data.table)
+library(readxl)
+library(glmtoolbox)
+library(MASS)  #for logistic reg
+library(RColorBrewer)
+
+here::i_am("code/10_7.rmd")
+```
+
+
+
+#############################################################################
+ASSOCIATION
+- Run code from 10_7.Rmd to get data
+
+Time point #1: Dec 1-23 (before closing for holidays)
+Time point #2: May 2021 (May 1-May 20, before schools in the south close for summer)
+
+svyglm: survey-weighted generalized linear models
+
+#############################################################################
+
+Start w/anxiety: December data
+```{r}
+
+#since 82% have "none" or "some" anxiety and 18% have "most" or "all of the time" --> dichotomize
+d4a_noNA_anx<- d4a %>%
+  mutate(anxiety=as.integer(anxiety)) %>%
+  filter(!is.na(anxiety)) %>%
+  mutate(
+    anxiety_binary= ifelse (anxiety %in% c(1,2), 0, 1),
+    anxiety_binary=as.integer(anxiety_binary),
+    gender=dplyr::recode(gender, "1"="Male", "2"="Female", "3"="Non-binary", "4"="Prefer to self-describe", "5"="Prefer not to answer"))
+
+#Dec
+d4a_anx_dec<- d4a_noNA_anx %>%
+  filter(date >= "2020-12-01") %>%
+  filter(date<= "2020-12-23") %>%
+  mutate(age=as.numeric(age))
+
+```
+
+QUICK CHECK:
+- age as continuous?
+```{r}
+#Calculate mean of anxiety_binary in each group- does it look linear? - generally yes (ignore NA age)
+#looked even more continuous w/December
+age_proportions <- d4a_noNA_anx %>%
+  group_by(age) %>%
+  summarise(success_rate = weighted.mean(anxiety_binary), w = weight) 
+
+ggplot(age_proportions, aes(x = age, y = success_rate)) +
+  geom_point() +
+  xlab("Binned Age") +
+  ylab("Proportion of Successes") +
+  ggtitle("Scatter Plot of Binned Age vs. Proportion of Successes")
+
+```
+
+#############################################################################
+Model 1
+- only predictors are in-person and hybrid
+#############################################################################
+
+December:
+```{r}
+anxiety_design_dec<- svydesign(ids = ~1, weights = ~weight, data = d4a_anx_dec) 
+mod_anxiety1_dec <- svyglm(anxiety_binary ~ modality_in_person_1_0 + modality_part_time_1_0, design=anxiety_design_dec, family=binomial)
+
+##########QUESTION: why am I getting warning: "Warning: non-integer #successes in a binomial glm?"
+count(x = d4a_anx_dec, anxiety_binary) %>% mutate(proportion = percent(n / sum(n))) #only 0 or 1 outcome
+#and I don't get that error when I ignore the survey weights:
+try_noweight_dec_anxiety <- glm(anxiety_binary ~ modality_in_person_1_0 + modality_part_time_1_0, data=d4a_anx_dec, family=binomial)
+summary(try_noweight_dec_anxiety) #get similar output as w/weights
+
+
+summary(mod_anxiety1_dec)
+
+#May
+d4a_anx_may<-d4a_noNA_anx %>%
+  filter(date >= "2021-05-01") %>%
+  filter(date<= "2021-05-20") %>%
+  mutate(age=as.numeric(age))
+  
+anxiety_design_may<- svydesign(ids = ~1, weights = ~weight, data = d4a_anx_may) 
+mod_anxiety1_may <- svyglm(anxiety_binary ~ modality_in_person_1_0 + modality_part_time_1_0, design=anxiety_design_may, family=binomial)
+summary(mod_anxiety1_may)
+
+
+```
+
+#############################################################################
+Model 2
+- consider age and gender as well
+#############################################################################
+
+```{r}
+#Dec
+
+mod_anxiety2_dec <- svyglm(anxiety_binary ~ modality_in_person_1_0 + modality_part_time_1_0 +
+                             age + gender, design=anxiety_design_dec, family=binomial)
+
+summary(mod_anxiety2_dec)
+
+
+#May
+mod_anxiety2_may <- svyglm(anxiety_binary ~ modality_in_person_1_0 + modality_part_time_1_0 +
+                             age + gender, design=anxiety_design_may, family=binomial)
+
+summary(mod_anxiety2_may)
+
+```
+
+#############################################################################
+Model 3
+- age, gender, region
+#############################################################################
+
+```{r}
+#Dec
+mod_anxiety3_dec <- svyglm(anxiety_binary ~ modality_in_person_1_0 + modality_part_time_1_0 +
+                             age + gender + REGION, design=anxiety_design_dec, family=binomial)
+
+summary(mod_anxiety3_dec)
+
+
+#May
+mod_anxiety3_may <- svyglm(anxiety_binary ~ modality_in_person_1_0 + modality_part_time_1_0 +
+                             age + gender + REGION, design=anxiety_design_may, family=binomial)
+
+summary(mod_anxiety3_may)
+
+```
+
+
+#############################################################################
+Model 4
+- age, gender, region, pct_dem, comorbidities
+#############################################################################
+
+```{r}
+#Dec
+mod_anxiety4_dec <- svyglm(anxiety_binary ~ modality_in_person_1_0 + modality_part_time_1_0 +
+                             age + gender + REGION + pct_dem + comorbid, design=anxiety_design_dec, family=binomial)
+
+summary(mod_anxiety4_dec)
+
+
+#May
+mod_anxiety4_may <- svyglm(anxiety_binary ~ modality_in_person_1_0 + modality_part_time_1_0 +
+                             age + gender + REGION + pct_dem + comorbid, design=anxiety_design_may, family=binomial)
+
+summary(mod_anxiety4_may)
+
+```
+
+#############################################################################
+Other thought: use logistic regression so output is restricted to between 0 and 1
+- but outcome of anxiety is not rare: so can't estimate RR. OR really weird to interpret
+- could use modified Poisson model?
+#############################################################################
+
+```{r}
+mod_anxiety1_dec_logistic <- svyglm(anxiety_binary ~ modality_in_person_1_0 + modality_part_time_1_0, design=anxiety_design_dec, family=binomial(link="logit"))
+summary(mod_anxiety1_dec_logistic)
+#OR in person = exp(-0.066) = 0.94. The odds of having medium or high anxiety is 0.94 times the odds of having low or no anxiety compared to those have a kid in person vs those who have a kid remote.
+```
+
+#############################################################################
+Other thought: as I control for covariates, do I restrict data so I have complete cases for those covariates?
+#############################################################################
+
+```{r}
+#example: model 2, december. Age and gender
+#Dec
+d4a_anx_dec_mod2<- d4a_anx_dec %>%
+    filter(!is.na(age)) %>%
+    filter(!is.na(gender))  #212046 obs
+```
