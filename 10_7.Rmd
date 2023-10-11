@@ -1,0 +1,839 @@
+---
+title: "10/7"
+author: "Rachel Slimovitch"
+date: "2023-10-06"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, tidy.opts=list(width.cutoff=60),tidy=TRUE)
+library(here)
+library(tidyverse)
+library(knitr) # to format tables
+library(lubridate) # to help extract the date
+library(covidcast)
+library(survey)
+library(tableone) # tableone
+library(kableExtra)
+library(magrittr)
+library(data.table)
+library(readxl)
+library(glmtoolbox)
+library(MASS)  #for logistic reg
+library(RColorBrewer)
+
+here::i_am("code/10_7.rmd")
+```
+
+#############################################################################
+READ IN DATA CORRECTLY:
+#############################################################################
+
+```{r}
+# set up data table
+d = data.table()
+
+#files: nov2020 to may2021
+files=c("2020-11.csv","2020-12.csv","2021-01.csv","2021-02.csv","2021-03.csv","2021-04.csv","2021-05.csv")
+
+# read in and bind data files
+for(i in 1:length(files)){
+  temp = fread(here("Data", files[i]))
+  d = rbindlist(list(d, temp), fill = TRUE)
+  print(i)
+}
+
+# link zip code to state- CHANGE TO MATCH ALYSSA'S CODE
+zip = data.table(read_excel(here("Data", "ZIP_Alyssa.xlsx"))) %>%
+  dplyr::select(ZIP, USPS_ZIP_PREF_STATE) %>% unique()
+
+#merge to data
+d<- d %>% 
+  left_join(zip %>% 
+           dplyr::select(ZIP, USPS_ZIP_PREF_STATE), #we only want these vars
+           by = c("A3" = "ZIP"))
+
+#add on region: using state_census data
+d1<-d %>%
+  left_join(state_census %>%
+              dplyr::select(REGION, ABBR),
+              by = c("USPS_ZIP_PREF_STATE" = "ABBR"))
+
+#CHECK PROPORTIONS
+#unweighted
+proportions <- count(x = d1, REGION) %>%
+  mutate(proportion = percent(n / sum(n)))
+
+#weighted
+proportions <- count(x = d1, REGION, wt = weight) %>%
+  mutate(proportion = percent(n / sum(n)))
+
+```
+
+#############################################################################
+DATA CLEANING
+*Note:* If included till Nov2021, exclude 2021-09-04 (errors)
+- date as date format, rename as "date" DONE
+- one variable for anxiety DONE
+- one variable for depression DONE
+- one variable for isolation  DONE
+- rename age, gender, grades, modality DONE
+- create remote variable DONE
+- make modality 1 or 0
+
+#############################################################################
+
+```{r}
+#date
+d1 <- d1 %>%
+  mutate(
+    StartDatetime = ymd_hms(StartDatetime), #StartDateTime as DateTime object
+    date = as.Date(StartDatetime) #create new variable date
+  )
+
+
+#STEP 2: 
+#create one variable for anxiety for Waves 5-11
+#rename age, gender, modality of schooling
+#create variable for remote (at least 1 child is learning fully remote)
+d2 <- d1 %>%
+    mutate(A5_1 = as.numeric(A5_1)) %>%
+    filter(!is.na(A5_1) & A5_1 >= 1 & A5_1<=20) %>% #at least 1 kid
+    rename(
+    age = D2,
+    gender = D1,
+    prek_or_k = E1_1,
+    grades1_5 = E1_2,
+    grades6_8 = E1_3,
+    grades9_12 = E1_4,
+    modality_in_person = E2_1,
+    modality_part_time = E2_2,
+    hh_num_children=A5_1
+  ) 
+
+d2<-d2 %>%
+  mutate(
+    anxiety = ifelse(!is.na(C8_1), C8_1, ifelse(!is.na(C8a_1), C8a_1, C18a)),
+    depression = ifelse(!is.na(C8_2), C8_2, ifelse(!is.na(C8a_2), C8a_2, C18b)),
+    isolation = ifelse(!is.na(C8_3), C8_3, C8a_3),
+    modality_remote = ifelse((prek_or_k > 0 | grades1_5 > 0 | grades6_8 > 0 | grades9_12 > 0) &
+                             modality_in_person == 3 & modality_part_time == 3, 1, 0),
+    modality_part_time_1_0 = ifelse(modality_part_time == 2, 1,
+                                     ifelse(modality_part_time == 3, 0, "NA")),
+    modality_in_person_1_0 = ifelse(modality_in_person == 2, 1,
+                                     ifelse(modality_in_person == 3, 0, "NA")),
+    comorbid = case_when(
+      C1 == "9" ~ "0", !grepl(",", C1) & C1 != "9" ~ "1", grepl(",", C1) & !grepl("9", C1) & length(unlist(strsplit(C1, ","))) >= 2 ~ "2+")
+  ) 
+
+#continue filtering parent: must have 1 kid in school (prek to grade 12)
+d3<- d2 %>%
+  filter(prek_or_k>=1 | grades1_5>=1 | grades6_8>=1 | grades9_12>=1) 
+
+d4<-d3 %>%
+  filter(!is.na(modality_in_person_1_0) & !is.na(modality_part_time_1_0))  %>% #both are left unanswered
+  filter(modality_in_person_1_0 !="NA" & modality_part_time_1_0 !="NA") #both are recorded as "don't know"
+
+
+```
+
+#############################################################################
+Create Table 1:
+- stratified by modality
+- not stratified
+#############################################################################
+
+```{r}
+#make variables factor: age, region, gender, comorbid
+d4<- d4 %>%
+  mutate(
+    REGION = as.factor(REGION),
+    REGION=dplyr::recode(REGION, "1"="Northeast", "2"="Midwest", "3"="South", "4"="West"),
+    age = as.factor(age),
+    gender = as.factor(gender),
+    comorbid = as.factor(comorbid),
+    #prek or k
+    prek_or_k=as.factor(prek_or_k),
+    prek_or_k = dplyr::recode(prek_or_k, "2" = "0"),
+    prek_or_k = fct_relevel(prek_or_k, "0", "1"),
+    #grades1-5
+    grades1_5=as.factor(grades1_5),
+    grades1_5 = dplyr::recode(grades1_5, "2" = "0"),
+    grades1_5 = fct_relevel(grades1_5, "0", "1"),
+    #grades6-8
+    grades6_8=as.factor(grades6_8),
+    grades6_8 = dplyr::recode(grades6_8, "2" = "0"),
+    grades6_8 = fct_relevel(grades6_8, "0", "1"),
+    #grades9-12
+    grades9_12=as.factor(grades9_12),
+    grades9_12 = dplyr::recode(grades9_12, "2" = "0"),
+    grades9_12= fct_relevel(grades9_12, "0", "1"),
+  )
+
+
+
+
+```
+
+
+#############################################################################
+Merge data with voting:
+#############################################################################
+
+```{r}
+#ran in ArcGIS: JSON to features (from NY Times data)
+votes_zip<-read.csv("/Users/rachelslimovitch/Documents/23-24/Brown/Thesis/Data/Votes_Zip.csv")
+
+#get FIPS
+votes_zip2<-votes_zip %>%
+  #make numeric, exclude where no votes
+  mutate(
+    DEM=as.numeric(DEM),
+    TOTAL=as.numeric(TOTAL)) %>%
+  filter(!TOTAL==0) %>%
+  #get first 5 digts from ID: FIPS code
+  mutate(fips = substr(ID, 1, 5))
+
+#sort by FIPS: combine votes, % dem by FIPS
+votes_zip3 <- votes_zip2 %>%
+  mutate(fips = as.numeric(fips)) %>%
+  group_by(fips) %>%
+  summarize(
+    TotalVotes = sum(TOTAL),
+    TotalDEM = sum(DEM)
+  ) %>%
+  mutate(pct_dem = TotalDEM / TotalVotes)
+
+d4a<- merge(d4, votes_zip3, by="fips")
+
+#add column: with quartiles
+quartiles <- quantile(d4a$pct_dem, probs = c(0.25, 0.5, 0.75))
+
+d4a<- d4a %>%
+  mutate(
+    quartile = ifelse(pct_dem < quartiles[1], "quartile 1",
+                      ifelse(pct_dem < quartiles[2], "quartile 2",
+                             ifelse(pct_dem < quartiles[3], "quartile 3", "quartile 4")))
+  )
+```
+
+
+Table:
+```{r}
+
+#make long dataframe: column for modality
+d5<- d4%>%
+  mutate(modality_remote = as.character(modality_remote)) %>%
+  pivot_longer(cols = c("modality_in_person_1_0", "modality_remote", "modality_part_time_1_0"), 
+               names_to = "modality", #column that contains type of modality
+               values_to = "modality_value") %>% #column that contains what the value is
+  filter(modality_value == 1)
+
+#vars
+vars_tbl<- c('age', 
+            'hh_num_children',
+            'REGION', 
+            'gender',
+            'comorbid',
+            'prek_or_k', 
+            'grades1_5', 
+            'grades6_8', 
+            'grades9_12')
+
+survey_design_d5<-svydesign(id=~1,
+          data=d5, 
+          weights=d5$weight)
+
+table_d5 <- svyCreateTableOne(
+      vars = c(vars_tbl),  # List the variables you want to include
+      data = survey_design_d5,
+      strata="modality"
+)
+
+kableone(table_d5) %>%
+      add_header_above(c("Table 1: Summary of Distributions of Covariates, Stratified by Modality (Weighted) "=6))%>%
+      kable_styling(position="center") %>%
+      kable_styling(latex_options= c("HOLD_position")) 
+
+table_d5_overall <- svyCreateTableOne(
+      vars = c(vars_tbl),  # List the variables you want to include
+      data = survey_design_d5
+)
+
+kableone(table_d5_overall) %>%
+      add_header_above(c("Table 1: Summary of Distributions of Covariates (Weighted) "=6))%>%
+      kable_styling(position="center") %>%
+      kable_styling(latex_options= c("HOLD_position")) 
+```
+
+
+#############################################################################
+Plots:
+- region
+- dem vote
+- comorbidities
+- covid concern
+
+Then, 2x2 facets:
+- region * dem vote
+- region * comorbidities
+- region * covid concern
+#############################################################################
+
+*First:* Overall
+```{r}
+days_per_group<- 7
+
+d4a_summarized <- d4a %>%
+  mutate(date_group = cut(date, breaks = seq(min(date), max(date) + 1, by = paste(days_per_group, "days")), labels = FALSE)) %>%
+  group_by(date_group) %>%
+  #anxiety, depression, isolation
+  summarize(
+    #anxiety
+        avg_anxiety_remote = weighted.mean(ifelse(modality_remote == 1, anxiety, NA), na.rm = TRUE, w = weight), 
+        avg_anxiety_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+        avg_anxiety_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+    #depression
+        avg_depression_remote = weighted.mean(ifelse(modality_remote == 1, depression, NA), na.rm = TRUE, w = weight), 
+        avg_depression_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+        avg_depression_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+    #isolation
+        avg_isolation_remote = weighted.mean(ifelse(modality_remote == 1, isolation, NA), na.rm = TRUE, w = weight), 
+        avg_isolation_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+        avg_isolation_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+    num_observations = n()
+  )
+
+#anxiety: each pt is week avg for that modality
+ggplot(d4a_summarized %>% 
+  gather(var, value, avg_anxiety_remote, avg_anxiety_hybrid, avg_anxiety_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point() +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Anxiety",
+       title = "Scatterplot of Average Anxiety by Modality") 
+
+#depression
+ggplot(d4a_summarized %>% 
+  gather(var, value, avg_depression_remote, avg_depression_hybrid, avg_depression_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point() +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Depression",
+       title = "Scatterplot of Average Depression by Modality, overall") 
+
+#isolation (ends May 20)
+ggplot(d4a_summarized %>% 
+  gather(var, value, avg_isolation_remote, avg_isolation_hybrid, avg_isolation_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point() +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Isolation",
+       title = "Scatterplot of Average Isolation by Modality, overall") 
+
+```
+
+Region: 
+```{r}
+d4a_region <- d4a %>%
+  mutate(date_group = cut(date, breaks = seq(min(date), max(date) + 1, by = paste(days_per_group, "days")), labels = FALSE)) %>%
+  group_by(date_group, REGION) %>%
+  #anxiety, depression, isolation
+  summarize(
+    #anxiety
+        avg_anxiety_remote = weighted.mean(ifelse(modality_remote == 1, anxiety, NA), na.rm = TRUE, w = weight), 
+        avg_anxiety_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+        avg_anxiety_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+    #depression
+        avg_depression_remote = weighted.mean(ifelse(modality_remote == 1, depression, NA), na.rm = TRUE, w = weight), 
+        avg_depression_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+        avg_depression_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+    #isolation
+        avg_isolation_remote = weighted.mean(ifelse(modality_remote == 1, isolation, NA), na.rm = TRUE, w = weight), 
+        avg_isolation_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+        avg_isolation_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+    num_observations = n()
+  )
+
+#anxiety: each pt is week avg for that modality
+ggplot(d4a_region %>% 
+  gather(var, value, avg_anxiety_remote, avg_anxiety_hybrid, avg_anxiety_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Anxiety",
+       title = "Scatterplot of Average Anxiety by Modality, Stratified by Region") +
+       facet_wrap(~REGION) 
+
+#depression
+ggplot(d4a_region %>% 
+  gather(var, value, avg_depression_remote, avg_depression_hybrid, avg_depression_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Depression",
+       title = "Scatterplot of Average Depression by Modality, Stratified by Region") +
+       facet_wrap(~REGION) 
+
+#isolation (ends May 20)
+ggplot(d4a_region %>% 
+  gather(var, value, avg_isolation_remote, avg_isolation_hybrid, avg_isolation_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Isolation",
+       title = "Scatterplot of Average Isolation by Modality, Stratified by Region") +
+       facet_wrap(~REGION) 
+```
+Pct democrat vote:
+```{r}
+d4a_pct_dem <- d4a %>%
+  mutate(date_group = cut(date, breaks = seq(min(date), max(date) + 1, by = paste(days_per_group, "days")), labels = FALSE)) %>%
+  group_by(date_group, quartile) %>%
+  #anxiety, depression, isolation
+  summarize(
+    #anxiety
+        avg_anxiety_remote = weighted.mean(ifelse(modality_remote == 1, anxiety, NA), na.rm = TRUE, w = weight), 
+        avg_anxiety_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+        avg_anxiety_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+    #depression
+        avg_depression_remote = weighted.mean(ifelse(modality_remote == 1, depression, NA), na.rm = TRUE, w = weight), 
+        avg_depression_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+        avg_depression_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+    #isolation
+        avg_isolation_remote = weighted.mean(ifelse(modality_remote == 1, isolation, NA), na.rm = TRUE, w = weight), 
+        avg_isolation_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+        avg_isolation_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+    num_observations = n()
+  )
+
+#anxiety: each pt is week avg for that modality
+ggplot(d4a_pct_dem %>% 
+  gather(var, value, avg_anxiety_remote, avg_anxiety_hybrid, avg_anxiety_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Anxiety",
+       title = "Scatterplot of Average Anxiety by Modality, Stratified by Quartile of Democratic Vote") +
+       facet_wrap(~quartile) 
+
+#depression
+ggplot(d4a_pct_dem %>% 
+  gather(var, value, avg_depression_remote, avg_depression_hybrid, avg_depression_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Depression",
+       title = "Scatterplot of Average Depression by Modality,Stratified by Quartile of Democratic Vote") +
+       facet_wrap(~quartile) 
+
+#isolation (ends May 20)
+ggplot(d4a_pct_dem %>% 
+  gather(var, value, avg_isolation_remote, avg_isolation_hybrid, avg_isolation_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Isolation",
+       title = "Scatterplot of Average Isolation by Modality,Stratified by Quartile of Democratic Vote") +
+       facet_wrap(~quartile) 
+```
+Comorbidities:
+```{r}
+d4a_comorbid <- d4a %>%
+  filter(!is.na(comorbid)) %>%
+  mutate(date_group = cut(date, breaks = seq(min(date), max(date) + 1, by = paste(days_per_group, "days")), labels = FALSE)) %>%
+  group_by(date_group, comorbid) %>%
+  #anxiety, depression, isolation
+  summarize(
+    #anxiety
+        avg_anxiety_remote = weighted.mean(ifelse(modality_remote == 1, anxiety, NA), na.rm = TRUE, w = weight), 
+        avg_anxiety_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+        avg_anxiety_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+    #depression
+        avg_depression_remote = weighted.mean(ifelse(modality_remote == 1, depression, NA), na.rm = TRUE, w = weight), 
+        avg_depression_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+        avg_depression_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+    #isolation
+        avg_isolation_remote = weighted.mean(ifelse(modality_remote == 1, isolation, NA), na.rm = TRUE, w = weight), 
+        avg_isolation_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+        avg_isolation_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+    num_observations = n()
+  )
+
+#anxiety: each pt is week avg for that modality
+ggplot(d4a_comorbid%>% 
+  gather(var, value, avg_anxiety_remote, avg_anxiety_hybrid, avg_anxiety_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Anxiety",
+       title = "Scatterplot of Average Anxiety by Modality, Stratified by Comorbidities") +
+       facet_wrap(~comorbid) 
+
+#depression
+ggplot(d4a_comorbid %>% 
+  gather(var, value, avg_depression_remote, avg_depression_hybrid, avg_depression_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Depression",
+       title = "Scatterplot of Average Depression by Modality,Stratified by Comorbidities") +
+       facet_wrap(~comorbid) 
+
+#isolation (ends May 20)
+ggplot(d4a_comorbid %>% 
+  gather(var, value, avg_isolation_remote, avg_isolation_hybrid, avg_isolation_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Isolation",
+       title = "Scatterplot of Average Isolation by Modality,Stratified by Comorbidities") +
+       facet_wrap(~comorbid) 
+```
+Covid concern:
+```{r}
+d4a_concern <- d4a %>%
+  mutate(C9=dplyr::recode(C9, "1"="Very worried", "2"="Somewhat worried", "3"="Not too worried", "4"="Not worried at all")) %>%
+  filter(!is.na(C9)) %>%
+  mutate(date_group = cut(date, breaks = seq(min(date), max(date) + 1, by = paste(days_per_group, "days")), labels = FALSE)) %>%
+  group_by(date_group, C9) %>%
+  #anxiety, depression, isolation
+  summarize(
+    #anxiety
+        avg_anxiety_remote = weighted.mean(ifelse(modality_remote == 1, anxiety, NA), na.rm = TRUE, w = weight), 
+        avg_anxiety_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+        avg_anxiety_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+    #depression
+        avg_depression_remote = weighted.mean(ifelse(modality_remote == 1, depression, NA), na.rm = TRUE, w = weight), 
+        avg_depression_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+        avg_depression_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+    #isolation
+        avg_isolation_remote = weighted.mean(ifelse(modality_remote == 1, isolation, NA), na.rm = TRUE, w = weight), 
+        avg_isolation_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+        avg_isolation_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+    num_observations = n()
+  )
+
+#anxiety: each pt is week avg for that modality
+ggplot(d4a_concern %>% 
+  gather(var, value, avg_anxiety_remote, avg_anxiety_hybrid, avg_anxiety_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Anxiety",
+       title = "Scatterplot of Average Anxiety by Modality, Stratified by Covid Concern") +
+       facet_wrap(~C9) 
+
+#only less worried:
+concern_low <- d4a_concern %>%
+  filter(C9 %in% c("Not too worried", "Not worried at all")) 
+
+ggplot(concern_low %>% 
+  gather(var, value, avg_anxiety_remote, avg_anxiety_hybrid, avg_anxiety_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Anxiety",
+       title = "Scatterplot of Average Anxiety by Modality, Stratified by Covid Concern") +
+       facet_wrap(~C9) 
+
+#only more worried:
+concern_high <- d4a_concern %>%
+  filter(C9 %in% c("Very worried", "Somewhat worried")) 
+
+ggplot(concern_high %>% 
+  gather(var, value, avg_anxiety_remote, avg_anxiety_hybrid, avg_anxiety_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Anxiety",
+       title = "Scatterplot of Average Anxiety by Modality, Stratified by Covid Concern") +
+       facet_wrap(~C9) 
+
+#depression
+ggplot(d4a_concern %>% 
+  gather(var, value, avg_depression_remote, avg_depression_hybrid, avg_depression_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Depression",
+       title = "Scatterplot of Average Depression by Modality,Stratified by Covid Concern") +
+       facet_wrap(~C9) 
+
+#isolation (ends May 20)
+ggplot(d4a_concern %>% 
+  gather(var, value, avg_isolation_remote, avg_isolation_hybrid, avg_isolation_inperson), aes(x = date_group, y = value, group = var, color=var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se=F) +
+  labs(x = "Date", 
+       y = "Average Isolation",
+       title = "Scatterplot of Average Isolation by Modality,Stratified by Covid Concern") +
+       facet_wrap(~C9) 
+```
+#############################################################################
+2x2 facets:
+- region * dem vote
+- region * comorbidities
+- region * covid concern
+#############################################################################
+
+Region + dem vote:
+```{r}
+d4a_region_dem <- d4a %>%
+  mutate(date=as.Date(date)) %>%
+  mutate(date_group = cut(date, breaks = seq(min(date), max(date) + 1, by = paste(days_per_group, "days")), labels = FALSE)) %>%
+  group_by(date_group, quartile, REGION) %>%
+  #anxiety, depression, isolation
+  summarize(
+    #anxiety
+        avg_anxiety_remote = weighted.mean(ifelse(modality_remote == 1, anxiety, NA), na.rm = TRUE, w = weight), 
+        avg_anxiety_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+        avg_anxiety_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+    #depression
+        avg_depression_remote = weighted.mean(ifelse(modality_remote == 1, depression, NA), na.rm = TRUE, w = weight), 
+        avg_depression_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+        avg_depression_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+    #isolation
+        avg_isolation_remote = weighted.mean(ifelse(modality_remote == 1, isolation, NA), na.rm = TRUE, w = weight), 
+        avg_isolation_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+        avg_isolation_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+    num_observations = n()
+  )
+
+#Anxiety
+ggplot(d4a_region_dem %>% 
+  gather(var, value, avg_anxiety_remote, avg_anxiety_hybrid, avg_anxiety_inperson), 
+  aes(x = date_group, y = value, group = var, color = var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se = FALSE) +
+  labs(x = "Date", 
+       y = "Average Anxiety",
+       title = "Scatterplot of Average Anxiety by Modality, by dem vote and region") +
+  facet_grid(quartile ~REGION)
+
+#Depression
+ggplot(d4a_region_dem %>% 
+  gather(var, value, avg_depression_remote, avg_depression_hybrid, avg_depression_inperson), 
+  aes(x = date_group, y = value, group = var, color = var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se = FALSE) +
+  labs(x = "Date", 
+       y = "Average Depression",
+       title = "Scatterplot of Average Depression by Modality, by dem vote and region") +
+  facet_grid(quartile ~REGION)
+
+#Isolation
+ggplot(d4a_region_dem %>% 
+  gather(var, value, avg_isolation_remote, avg_isolation_hybrid, avg_isolation_inperson), 
+  aes(x = date_group, y = value, group = var, color = var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se = FALSE) +
+  labs(x = "Date", 
+       y = "Average isolation",
+       title = "Scatterplot of Average Isolation by Modality, by dem vote and region") +
+  facet_grid(quartile ~REGION)
+
+```
+
+Region + comorbidities:
+```{r}
+d4a_region_comorbid <- d4a %>%
+  mutate(date=as.Date(date)) %>%
+  filter(!is.na(comorbid)) %>%
+  mutate(date_group = cut(date, breaks = seq(min(date), max(date) + 1, by = paste(days_per_group, "days")), labels = FALSE)) %>%
+  group_by(date_group, comorbid, REGION) %>%
+  #anxiety, depression, isolation
+  summarize(
+    #anxiety
+        avg_anxiety_remote = weighted.mean(ifelse(modality_remote == 1, anxiety, NA), na.rm = TRUE, w = weight), 
+        avg_anxiety_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+        avg_anxiety_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+    #depression
+        avg_depression_remote = weighted.mean(ifelse(modality_remote == 1, depression, NA), na.rm = TRUE, w = weight), 
+        avg_depression_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+        avg_depression_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+    #isolation
+        avg_isolation_remote = weighted.mean(ifelse(modality_remote == 1, isolation, NA), na.rm = TRUE, w = weight), 
+        avg_isolation_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+        avg_isolation_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+    num_observations = n()
+  )
+
+#Anxiety
+ggplot(d4a_region_comorbid %>% 
+  gather(var, value, avg_anxiety_remote, avg_anxiety_hybrid, avg_anxiety_inperson), 
+  aes(x = date_group, y = value, group = var, color = var)) +
+  geom_point(size = 1, alpha = 0.5) +
+  geom_smooth(se = FALSE) +
+  labs(x = "Date", 
+       y = "Average Anxiety",
+       title = "Scatterplot of Average Anxiety by Modality, by comorbidities and region") +
+  facet_grid(REGION ~comorbid)
+
+#only 0 or 1 comorbidity:
+comorbid_0_1<- d4a_region_comorbid %>%
+  filter(comorbid %in% c("0", "1")) 
+
+ggplot(comorbid_0_1 %>% 
+  gather(var, value, avg_anxiety_remote, avg_anxiety_hybrid, avg_anxiety_inperson), 
+  aes(x = date_group, y = value, group = var, color = var)) +
+  geom_point(size = 1, alpha = 0.5) +
+  geom_smooth(se = FALSE) +
+  labs(x = "Date", 
+       y = "Average Anxiety",
+       title = "Scatterplot of Average Anxiety by Modality, by comorbidities and region") +
+  facet_grid(REGION ~comorbid)
+
+#Depression
+ggplot(d4a_region_comorbid %>% 
+  gather(var, value, avg_depression_remote, avg_depression_hybrid, avg_depression_inperson), 
+  aes(x = date_group, y = value, group = var, color = var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se = FALSE) +
+  labs(x = "Date", 
+       y = "Average Depression",
+       title = "Scatterplot of Average Depression by Modality, by comorbidities and region") +
+  facet_grid(REGION ~comorbid)
+
+#Isolation
+ggplot(d4a_region_comorbid %>% 
+  gather(var, value, avg_isolation_remote, avg_isolation_hybrid, avg_isolation_inperson), 
+  aes(x = date_group, y = value, group = var, color = var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se = FALSE) +
+  labs(x = "Date", 
+       y = "Average isolation",
+       title = "Scatterplot of Average Isolation by Modality, by comorbidities and region") +
+  facet_grid(REGION ~ comorbid)
+
+```
+
+Region + covid concern:
+```{r}
+d4a_region_concern <- d4a %>%
+  mutate(date=as.Date(date)) %>%
+  mutate(C9=dplyr::recode(C9, "1"="1)Very worried", "2"="2)Somewhat worried", "3"="3)Not too worried", "4"="4)Not worried at all")) %>%
+  filter(!is.na(C9)) %>%
+  mutate(date_group = cut(date, breaks = seq(min(date), max(date) + 1, by = paste(days_per_group, "days")), labels = FALSE)) %>%
+  group_by(date_group, C9, REGION) %>%
+  #anxiety, depression, isolation
+  summarize(
+    #anxiety
+        avg_anxiety_remote = weighted.mean(ifelse(modality_remote == 1, anxiety, NA), na.rm = TRUE, w = weight), 
+        avg_anxiety_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+        avg_anxiety_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+    #depression
+        avg_depression_remote = weighted.mean(ifelse(modality_remote == 1, depression, NA), na.rm = TRUE, w = weight), 
+        avg_depression_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+        avg_depression_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+    #isolation
+        avg_isolation_remote = weighted.mean(ifelse(modality_remote == 1, isolation, NA), na.rm = TRUE, w = weight), 
+        avg_isolation_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+        avg_isolation_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+    num_observations = n()
+  )
+
+#Anxiety
+ggplot(d4a_region_concern %>% 
+  gather(var, value, avg_anxiety_remote, avg_anxiety_hybrid, avg_anxiety_inperson), 
+  aes(x = date_group, y = value, group = var, color = var)) +
+  geom_point(size = 1, alpha = 0.5) +
+  geom_smooth(se = FALSE) +
+  labs(x = "Date", 
+       y = "Average Anxiety",
+       title = "Scatterplot of Average Anxiety by Modality, by concern and region") +
+  facet_grid(REGION ~C9) +
+  scale_color_brewer(palette="Dark2")
+
+#Depression
+ggplot(d4a_region_concern %>% 
+  gather(var, value, avg_depression_remote, avg_depression_hybrid, avg_depression_inperson), 
+  aes(x = date_group, y = value, group = var, color = var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se = FALSE) +
+  labs(x = "Date", 
+       y = "Average Depression",
+       title = "Scatterplot of Average Depression by Modality, by concern and region") +
+  facet_grid(REGION ~C9)
+
+#Isolation
+ggplot(d4a_region_concern %>% 
+  gather(var, value, avg_isolation_remote, avg_isolation_hybrid, avg_isolation_inperson), 
+  aes(x = date_group, y = value, group = var, color = var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se = FALSE) +
+  labs(x = "Date", 
+       y = "Average isolation",
+       title = "Scatterplot of Average Isolation by Modality, by concern and region") +
+  facet_grid(REGION ~ C9)
+
+```
+Dem vote *comorb:
+```{r}
+d4a_dem_comorbid <- d4a %>%
+  mutate(date=as.Date(date)) %>%
+  filter(!is.na(comorbid)) %>%
+  mutate(date_group = cut(date, breaks = seq(min(date), max(date) + 1, by = paste(days_per_group, "days")), labels = FALSE)) %>%
+  group_by(date_group, comorbid, quartile) %>%
+  #anxiety, depression, isolation
+  summarize(
+    #anxiety
+        avg_anxiety_remote = weighted.mean(ifelse(modality_remote == 1, anxiety, NA), na.rm = TRUE, w = weight), 
+        avg_anxiety_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+        avg_anxiety_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, anxiety, NA), na.rm=TRUE, w=weight),
+    #depression
+        avg_depression_remote = weighted.mean(ifelse(modality_remote == 1, depression, NA), na.rm = TRUE, w = weight), 
+        avg_depression_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+        avg_depression_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, depression, NA), na.rm=TRUE, w=weight),
+    #isolation
+        avg_isolation_remote = weighted.mean(ifelse(modality_remote == 1, isolation, NA), na.rm = TRUE, w = weight), 
+        avg_isolation_hybrid = weighted.mean(ifelse(modality_part_time_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+        avg_isolation_inperson = weighted.mean(ifelse(modality_in_person_1_0==1, isolation, NA), na.rm=TRUE, w=weight),
+    num_observations = n()
+  )
+
+#Anxiety
+ggplot(d4a_dem_comorbid %>% 
+  gather(var, value, avg_anxiety_remote, avg_anxiety_hybrid, avg_anxiety_inperson), 
+  aes(x = date_group, y = value, group = var, color = var)) +
+  geom_point(size = 1, alpha = 0.4) +
+  geom_smooth(se = FALSE) +
+  labs(x = "Date", 
+       y = "Average Anxiety",
+       title = "Scatterplot of Average Anxiety by Modality, by # of Comorbidities and % Democratic Vote") +
+  facet_grid(quartile ~comorbid) +
+  scale_color_brewer(palette="Dark2") +
+  theme(plot.title = element_text(size = 10))
+
+#Depression
+ggplot(d4a_dem_comorbid %>% 
+  gather(var, value, avg_depression_remote, avg_depression_hybrid, avg_depression_inperson), 
+  aes(x = date_group, y = value, group = var, color = var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se = FALSE) +
+  labs(x = "Date", 
+       y = "Average Depression",
+       title = "Scatterplot of Average Depression by Modality, by # of Comorbidities and % Democratic Vote") +
+  facet_grid(quartile ~comorbid) +
+  scale_color_brewer(palette="Dark2") +
+  theme(plot.title = element_text(size = 10))
+
+#Isolation
+ggplot(d4a_dem_comorbid %>% 
+  gather(var, value, avg_isolation_remote, avg_isolation_hybrid, avg_isolation_inperson), 
+  aes(x = date_group, y = value, group = var, color = var)) +
+  geom_point(size = 1, alpha = 0.7) +
+  geom_smooth(se = FALSE) +
+  labs(x = "Date", 
+       y = "Average isolation",
+       title = "Scatterplot of Average Isolation by Modality, by # of Comorbidities and % Democratic Vote") +
+  facet_grid(quartile~ comorbid) +
+  scale_color_brewer(palette="Dark2") +
+  theme(plot.title = element_text(size = 10))
+
+
+
+```
+
+
+
