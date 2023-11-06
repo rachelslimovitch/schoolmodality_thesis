@@ -1,0 +1,471 @@
+---
+title: "11_6"
+author: "Rachel Slimovitch"
+date: "2023-11-06"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, tidy.opts=list(width.cutoff=60),tidy=TRUE)
+library(here)
+library(tidyverse)
+library(knitr) # to format tables
+library(lubridate) # to help extract the date
+library(covidcast)
+library(survey)
+library(tableone) # tableone
+library(kableExtra)
+library(magrittr)
+library(data.table)
+library(readxl)
+library(glmtoolbox)
+library(MASS)  #for logistic reg
+library(RColorBrewer)
+library(lubridate)
+library(multcomp)
+here::i_am("code/11_7.rmd")
+```
+
+#############################################################################
+READ IN DATA: DEC 2020 - MAY 2021
+#############################################################################
+
+# 01 *Step 1:* 
+reading in Dec2020 - May 2021 data, getting region data, attaching quartile data (can skip this)
+
+```{r}
+#Dec through May
+files=c("2020-12.csv", "2021-01.csv","2021-02.csv","2021-03.csv","2021-04.csv","2021-05.csv")
+d_a = data.table()
+
+#get data
+for(i in 1:length(files)){
+  temp = fread(here("Data", files[i]))
+  d_a = rbindlist(list(d_a, temp), fill = TRUE)
+  print(i)
+}
+
+# initial sample size
+print(dim(d_a))
+
+# aggregate data over weeks
+d_a3 = d_a
+d_a3 = d_a3[, date:=as.Date(EndDatetime)]
+d_a3 = d_a3[, week:=epiweek(date)]
+d_a3 = d_a3[, week_date:=max(date), by = week]
+
+# filter by non-NA zip code
+d_a3 = d_a3 %>% mutate(A3=as.integer(A3))
+d_a4 = d_a3[!is.na(A3),]
+print(dim(d_a4))
+
+
+# link zip code to state
+zip = data.table(read_excel(here("Data", "ZIP_Alyssa.xlsx")) %>%
+  mutate(A3 = as.integer(ZIP))) %>% dplyr::select(A3, USPS_ZIP_PREF_STATE) %>% unique()
+
+# match to zip
+d_a5 = zip[d_a4, on = .(A3), nomatch = NULL]
+print(dim(d_a5))
+
+# match to census
+d_a6<-d_a5 %>%
+  left_join(state_census %>%
+              dplyr::select(REGION, ABBR),
+            by = c("USPS_ZIP_PREF_STATE" = "ABBR"))
+
+# check region
+weighted.mean(d_a6$REGION==1, w = d_a6$weight)
+weighted.mean(d_a6$REGION==2, w = d_a6$weight)
+weighted.mean(d_a6$REGION==3, w = d_a6$weight)
+weighted.mean(d_a6$REGION==4, w = d_a6$weight)
+```
+
+```{r}
+#filter: so we end on May 20, 2021
+d1b<- d_a6 %>%
+  filter(StartDatetime<= "2021-05-20")
+
+#create date range
+date_range <- seq(as.Date("2020-12-01"), as.Date("2021-05-20"), by = "1 day")
+day <- seq_along(date_range)
+date_table<-data.table(date = date_range, day = day)
+```
+
+Clean data, create new variables:
+
+```{r}
+#make date var and rename 
+d2 <- d1b %>%
+  mutate(
+    date = as.Date(StartDatetime), #create new variable date
+    hh_total=as.integer(A5_1)+as.integer(A5_2)+as.integer(A5_3) #num in household
+  ) %>%
+  rename(
+    age = D2,
+    gender = D1,
+    prek_or_k = E1_1,
+    grades1_5 = E1_2,
+    grades6_8 = E1_3,
+    grades9_12 = E1_4,
+    modality_in_person = E2_1,
+    modality_part_time = E2_2,
+    hh_num_children=A5_1,
+    hh_num_18_64=A5_2,
+    hh_num_65up=A5_3,
+    worried_covid=C9,
+    financial_worry=C15,
+    education_level=D8,
+    employment=D9
+  ) 
+
+#create anxiety, dep, isoliation, modality variables, comorbidity variable
+d3<- d2 %>%
+   mutate(
+    anxiety = ifelse(!is.na(C8_1), C8_1, ifelse(!is.na(C8a_1), C8a_1, C18a)),
+    depression = ifelse(!is.na(C8_2), C8_2, ifelse(!is.na(C8a_2), C8a_2, C18b)),
+    isolation = ifelse(!is.na(C8_3), C8_3, C8a_3),
+    modality_remote = ifelse((prek_or_k > 0 | grades1_5 > 0 | grades6_8 > 0 | grades9_12 > 0) &
+                             modality_in_person == 3 & modality_part_time == 3, 1, 0),
+    modality_part_time_1_0 = ifelse(modality_part_time == 2, 1,
+                                     ifelse(modality_part_time == 3, 0, "NA")),
+    modality_in_person_1_0 = ifelse(modality_in_person == 2, 1,
+                                     ifelse(modality_in_person == 3, 0, "NA")),
+    #num people
+    hh_num_children=as.integer(hh_num_children),
+    hh_num_18_64=as.integer(hh_num_18_64),
+    hh_num_65up=as.integer(hh_num_65up),
+    #create categorical variable for comorbidities
+    comorbid = case_when(
+      C1 == "9" ~ "0", !grepl(",", C1) & C1 != "9" ~ "1", grepl(",", C1) & 
+        !grepl("9", C1) & length(unlist(strsplit(C1, ","))) >= 2 ~ "2plus"),
+        REGION = as.factor(REGION),
+    #hh num: make NA if greater than 10 kids, 15 household people
+    hh_total=ifelse(hh_total>15, NA, hh_total),
+    hh_num_children=ifelse(hh_num_children>10, NA, hh_num_children),
+    #edits fips: so it is always 5 digits
+    #create variable for first 2 digits in FIPS
+    fips= sprintf("%05d", fips),
+    fips_2 = substr(fips, 1, 2),
+    #make variables factors
+      REGION = as.factor(REGION),
+      age = as.factor(age),
+      gender = as.factor(gender),
+      comorbid = as.factor(comorbid),
+      #prek or k
+      prek_or_k=as.factor(prek_or_k),
+      prek_or_k = dplyr::recode(prek_or_k, "2" = "0"),
+      prek_or_k = fct_relevel(prek_or_k, "0", "1"),
+      #grades1-5
+      grades1_5=as.factor(grades1_5),
+      grades1_5 = dplyr::recode(grades1_5, "2" = "0"),
+      grades1_5 = fct_relevel(grades1_5, "0", "1"),
+      #grades6-8
+      grades6_8=as.factor(grades6_8),
+      grades6_8 = dplyr::recode(grades6_8, "2" = "0"),
+      grades6_8 = fct_relevel(grades6_8, "0", "1"),
+      #grades9-12
+      grades9_12=as.factor(grades9_12),
+      grades9_12 = dplyr::recode(grades9_12, "2" = "0"),
+      grades9_12= fct_relevel(grades9_12, "0", "1"),
+      #recode employment
+      employment=as.factor(employment),
+      employment=dplyr::recode(employment, "2"="0"),
+      employment=fct_relevel(employment, "0", "1"),
+    #give names
+    gender=dplyr::recode(gender, "1"="Male", "2"="Female", "3"="Nonbinary", 
+                         "4"="Prefer to self-describe", "5"="Prefer not to answer"),
+    age=dplyr::recode(age, "1"="18-24yrs", "2"="25-34yrs", "3"="35-44yrs", 
+                      "4"="45-54yrs", "5"="55-64yrs", "6"="65-74yrs", "7"="75+yrs"),
+    #create week number
+    week_no=paste(week(date), year(date))
+  )
+
+  
+
+```
+
+
+Merge with voting data, date #
+
+```{r}
+votes_zip1<-read.csv("/Users/rachelslimovitch/Documents/23-24/Brown/Thesis/Data/vote_data.csv")
+
+votes_zip2<-votes_zip1 %>%
+  #make numeric, exclude where no votes
+  mutate(
+    DEM=as.numeric(votes_dem),
+    TOTAL=as.numeric(votes_total),
+    fips= sprintf("%05d", GEOID_5)) 
+
+#sort by 5digit fips: combine votes, % dem by FIPS
+votes_zip3 <- votes_zip2 %>%
+  group_by(fips) %>%
+  summarize(
+    TotalVotes = sum(TOTAL),
+    TotalDEM = sum(DEM)
+  ) %>%
+  mutate(pct_dem = TotalDEM / TotalVotes)
+
+d4 <- left_join(d3, votes_zip3, by = "fips")
+
+quartiles <- quantile(d4$pct_dem, probs = c(0.25, 0.5, 0.75), na.rm=TRUE)
+
+d5<- d4 %>%
+  mutate(
+    quartile = ifelse(pct_dem < quartiles[1], "quartile1",
+                      ifelse(pct_dem < quartiles[2], "quartile2",
+                             ifelse(pct_dem < quartiles[3], "quartile3", "quartile4")))
+  )
+
+#merge with date #
+d6<-d5[date_table, on="date"]
+
+#create binary MH outcomes, week_no
+d7<- d6 %>%
+  mutate(
+    anxiety_binary = ifelse (anxiety %in% c(1,2), 0, 1),
+    depression_binary = ifelse (depression %in% c(1,2), 0, 1),
+    isolation_binary = ifelse (isolation %in% c(1,2), 0, 1),
+    week_no=paste(week(date), year(date))
+  )
+```
+
+
+Export data. 
+```{r}
+write.csv(d7, file="/Users/rachelslimovitch/Documents/23-24/Brown/Thesis/Data/DEC_MAY_FINAL.csv", row.names = FALSE)
+
+```
+
+# 02 Read in this CSV. (if starting here)
+```{r}
+file="DEC_MAY_FINAL.csv"
+d7 = fread(here("Data", "DEC_MAY_FINAL.csv"))
+
+```
+
+# 03 Consider just parents
+- no missing outcome
+- no missing exposure
+```{r}
+#parent/guardian 1-10 kids
+d7_filter1<- d7 %>%
+  mutate(hh_num_children=as.integer(hh_num_children)) %>%
+  filter(!is.na(hh_num_children) & hh_num_children >= 1 & hh_num_children<=10) 
+
+#missing MH
+d7_filter2 <- d7_filter1 %>%
+  filter(!is.na(anxiety)) %>%
+  filter(!is.na(depression)) %>%
+  filter(!is.na(isolation))
+
+```
+
+#04 How many have each type of child (of those w/child under 18)?
+- prek or k
+- grades 1-5
+- grades 6-8
+- grades 9-12
+- other 
+```{r}
+d7_filter3 <- d7_filter2 %>%
+  mutate(below_prek = 
+           ifelse(prek_or_k == 0 & grades1_5 == 0 & grades6_8 == 0 & grades9_12 == 0, 1, 0))
+
+#examine how many are in each grade:
+d7_filter3a <- d7_filter3 %>%
+  mutate(
+    #make 5 = NA
+      prek_or_k=dplyr::recode(prek_or_k, "5"="NA"),
+      grades1_5=dplyr::recode(grades1_5, "5"="NA"),
+      grades6_8=dplyr::recode(grades6_8, "5"="NA"),
+      grades9_12=dplyr::recode(grades9_12, "5"="NA"),
+    #make integers
+    prek_or_k_int = as.integer(as.character(prek_or_k)), #make character first to keep 0/1 level
+    grades1_5_int = as.integer(as.character(grades1_5)),
+    grades6_8_int = as.integer(as.character(grades6_8)),
+    grades9_12_int = as.integer(as.character(grades9_12))
+  )
+
+#find sum
+mean_belowprek<- weighted.mean(d7_filter3a$below_prek==1, w = d7_filter3a$weight, na.rm=TRUE)
+mean_prekork<- weighted.mean(d7_filter3a$prek_or_k_int==1, w = d7_filter3a$weight, na.rm=TRUE)
+mean_gr1_5<- weighted.mean(d7_filter3a$grades1_5_int==1, w = d7_filter3a$weight, na.rm=TRUE)
+meangr6_8<- weighted.mean(d7_filter3a$grades6_8==1, w = d7_filter3a$weight, na.rm=TRUE)
+meangr9_12<-weighted.mean(d7_filter3a$grades9_12==1, w = d7_filter3a$weight, na.rm=TRUE)
+
+sum_below_prek<-sum(d7_filter3a$below_prek, na.rm=TRUE)
+sum_prek_or_k<-sum(d7_filter3a$prek_or_k_int, na.rm=TRUE)
+sum_grades1_5<-sum(d7_filter3a$grades1_5_int, na.rm=TRUE)
+sum_grades6_8<-sum(d7_filter3a$grades6_8_int, na.rm=TRUE)
+sum_grades9_12<-sum(d7_filter3a$grades9_12_int, na.rm=TRUE)
+
+sum_table <- data.frame(
+  variable = c("below_prek", "prek_or_k", "grades1_5", "grades6_8", "grades9_12"),
+  sum = c(sum_below_prek, sum_prek_or_k, sum_grades1_5, sum_grades6_8, sum_grades9_12)
+)
+
+mean_table <- data.frame(
+  variable = c("mean_belowprek", "mean_prekork", "mean_gr1_5", "mean_gr6_8", "mean_gr9_12"),
+  sum = c(mean_belowprek, mean_prekork, mean_gr1_5, meangr6_8, meangr9_12)
+)
+View(sum_table)
+View()
+
+
+#quick check- modality
+check<- d7_filter4 %>% 
+  dplyr::select(c(modality_in_person_1_0, modality_part_time_1_0, modality_remote)) %>%
+  mutate(total= as.integer(modality_in_person_1_0) + 
+           as.integer(modality_part_time_1_0) + 
+           as.integer(modality_remote))
+
+```
+
+#05 Filter if K-12 and missing modality
+
+```{r}
+#among those who answered 1 for at least one grade level: make sure school modality isn't missing
+d7_filter4 <- d7_filter3
+
+#for loop: if at least one grade =1, then filter so modality is known.
+###### HELP - THIS IS AN EMPTY DATAFRAME??
+for (i in 1:nrow(d7_filter4)) {
+  if (any(d7_filter4$prek_or_k==1 | d7_filter4$grades1_5==1 |  d7_filter4$grades6_8==1 | d7_filter4$grades9_12==1)){
+     d7_filter4 <- d7_filter4 %>%
+      filter(
+        row_number() == i,
+        !is.na(modality_in_person_1_0) & !is.na(modality_part_time_1_0),
+        modality_in_person_1_0 != "NA" & modality_part_time_1_0 != "NA"
+      )
+  }}
+
+```
+
+#05 School District
+
+```{r}
+
+NYC_zip<- c(10001, 10002, 10003, 10004, 10005, 10006, 10007, 10009, 10010, 10011, 
+            10012, 10013, 10014, 10016, 10017, 10018, 10019, 10020, 10021, 10022,
+            10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 
+            10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10044, 10065, 
+            10069, 10075, 10103, 10110, 10111, 10112, 10115, 10119, 10128, 10152, 
+            10153, 10154, 10162, 10165, 10167, 10168, 10169, 10170, 10171, 10172, 
+            10173, 10174, 10177, 10199, 10271, 10278, 10279, 10280, 10282, 10301, 
+            10302, 10303, 10304, 10305, 10306, 10307, 10308, 10309, 10310, 10311, 
+            10312, 10314, 10451, 10452, 10453, 10454, 10455, 10456, 10457, 10458, 
+            10459, 10460, 10461, 10462, 10463, 10464, 10465, 10466, 10467, 10468, 
+            10469, 10470, 10471, 10472, 10473, 10474, 10475, 11001, 11003, 11004, 
+            11005, 11040, 11101, 11102, 11103, 11104, 11105, 11106, 11109, 11201, 
+            11203, 11204, 11205, 11206, 11207, 11208, 11209, 11210, 11211, 11212, 
+            11213, 11214, 11215, 11216, 11217, 11218, 11219, 11220, 11221, 11222, 
+            11223, 11224, 11225, 11226, 11228, 11229, 11230, 11231, 11232, 11233, 
+            11234, 11235, 11236, 11237, 11238, 11239, 11351, 11354, 11355, 11356, 
+            11357, 11358, 11359, 11360, 11361, 11362, 11363, 11364, 11365, 11366, 
+            11367, 11368, 11369, 11370, 11371, 11372, 11373, 11374, 11375, 11377, 
+            11378, 11379, 11385, 11411, 11412, 11413, 11414, 11415, 11416, 11417, 
+            11418, 11419, 11420, 11421, 11422, 11423, 11424, 11425, 11426, 11427, 
+            11428, 11429, 11430, 11432, 11433, 11434, 11435, 11436, 11451, 11581, 
+            11691, 11692, 11693, 11694, 11697)
+
+LA_zip<- c(90001, 90002, 90003, 90004, 90005, 90006, 90007, 90008, 90010, 90011, 
+           90012, 90013, 90014, 90015, 90016, 90017, 90018, 90019, 90020, 90021, 
+           90022, 90023, 90024, 90025, 90026, 90027, 90028, 90029, 90031, 90032, 
+           90033, 90034, 90035, 90036, 90037, 90038, 90039, 90040, 90041, 90042, 
+           90043, 90044, 90045, 90046, 90047, 90048, 90049, 90056, 90057, 90058, 
+           90059, 90061, 90062, 90063, 90064, 90065, 90066, 90067, 90068, 90069, 
+           90071, 90073, 90077, 90079, 90089, 90090, 90094, 90095, 90201, 90210, 
+           90211, 90212, 90220, 90221, 90230, 90232, 90241, 90247, 90248, 90249, 
+           90250, 90255, 90262, 90265, 90270, 90272, 90275, 90280, 90290, 90291, 
+           90292, 90293, 90301, 90302, 90303, 90402, 90405, 90501, 90502, 90505, 
+           90640, 90710, 90717, 90731, 90732, 90744, 90745, 90746, 90802, 90805, 
+           90806, 90807, 90810, 90813, 91030, 91040, 91042, 91105, 91204, 91214, 
+           91302, 91303, 91304, 91306, 91307, 91311, 91316, 91321, 91324, 91325, 
+           91326, 91330, 91331, 91335, 91340, 91342, 91343, 91344, 91345, 91352, 
+           91356, 91364, 91367, 91371, 91381, 91387, 91401, 91402, 91403, 91405, 
+           91406, 91411, 91423, 91436, 91504, 91505, 91601, 91602, 91604, 91605, 
+           91606, 91607, 91608, 91754, 91803)
+           
+Chicago_zip<- c(60007, 60018, 60068, 60106, 60131, 60176, 60601, 60602, 60603, 
+                60604, 60605, 60606, 60607, 60608, 60609, 60610, 60611, 60612, 
+                60613, 60614, 60615, 60616, 60617, 60618, 60619, 60620, 60621, 
+                60622, 60623, 60624, 60625, 60626, 60628, 60629, 60630, 60631, 
+                60632, 60633, 60634, 60636, 60637, 60638, 60639, 60640, 60641, 
+                60642, 60643, 60644, 60645, 60646, 60647, 60649, 60651, 60652,
+                60653, 60654, 60655, 60656, 60657, 60659, 60660, 60661, 60706, 
+                60707, 60714, 60804, 60805, 60827)
+
+Miami_Dade_zip<- c(33010, 33012, 33013, 33014, 33015, 33016, 33018, 33030, 33031, 
+                   33032, 33033, 33034, 33035, 33039, 33054, 33055, 33056, 33101, 
+                   33109, 33122, 33125, 33126, 33127, 33128, 33129, 33130, 33131, 
+                   33132, 33133, 33134, 33135, 33136, 33137, 33138, 33139, 33140, 
+                   33141, 33142, 33143, 33144, 33145, 33146, 33147, 33149, 33150, 
+                   33154, 33155, 33156, 33157, 33158, 33160, 33161, 33162, 33165, 
+                   33166, 33167, 33168, 33169, 33170, 33172, 33173, 33174, 33175, 
+                   33176, 33177, 33178, 33179, 33180, 33181, 33182, 33183, 33184, 
+                   33185, 33186, 33187, 33189, 33190, 33193, 33194, 33196)
+
+Clark_zip<- c(89002, 89004, 89005, 89007, 89011, 89012, 89014, 89015, 89018, 89019, 
+              89021, 89025, 89026, 89027, 89029, 89030, 89031, 89032, 89039, 89040, 
+              89044, 89046, 89052, 89054, 89074, 89081, 89084, 89085, 89086, 89101, 
+              89102, 89103, 89104, 89106, 89107, 89108, 89109, 89110, 89113, 89115, 
+              89117, 89118, 89119, 89120, 89121, 89122, 89123, 89124, 89128, 89129, 
+              89130, 89131, 89134, 89135, 89138, 89139, 89141, 89142, 89143, 89144, 
+              89145, 89146, 89147, 89148, 89149, 89156, 89161, 89166, 89169, 89178, 
+              89179, 89183, 89191)
+
+Broward_zip<-c(33004, 33009, 33019, 33020, 33021, 33023, 33024, 33025, 33026, 
+               33027, 33028, 33029, 33060, 33062, 33063, 33064, 33065, 33066, 
+               33067, 33068, 33069, 33071, 33073, 33076, 33301, 33304, 33305, 
+               33306, 33308, 33309, 33311, 33312, 33313, 33314, 33315, 33316, 
+               33317, 33319, 33321, 33322, 33323, 33324, 33325, 33326, 33327, 
+               33328, 33330, 33331, 33332, 33334, 33351, 33428, 33441, 33442)
+  
+Houston_zip<-c(77002, 77003, 77004, 77005, 77006, 77007, 77008, 77009, 77010, 
+               77011, 77012, 77013, 77015, 77016, 77017, 77018, 77019, 77020, 
+               77021, 77022, 77023, 77024, 77025, 77026, 77027, 77028, 77029, 
+               77030, 77031, 77033, 77035, 77036, 77037, 77042, 77044, 77045, 
+               77046, 77047, 77048, 77049, 77050, 77051, 77053, 77054, 77055, 
+               77056, 77057, 77061, 77063, 77071, 77074, 77075, 77076, 77077, 
+               77078, 77079, 77081, 77085, 77087, 77088, 77089, 77091, 77092, 
+               77093, 77096, 77098, 77099, 77201, 77396, 77401, 77477, 77489,
+               77506, 77547)
+
+Hillsborough_zip<-c(33503, 33510, 33511, 33527, 33534, 33540, 33547, 33548, 33549, 
+                    33556, 33558, 33559, 33563, 33565, 33566, 33567, 33569, 33570, 
+                    33572, 33573, 33578, 33579, 33584, 33592, 33594, 33596, 33598, 
+                    33602, 33603, 33604, 33605, 33606, 33607, 33609, 33610, 33611, 
+                    33612, 33613, 33614, 33615, 33616, 33617, 33618, 33619, 33620, 
+                    33621, 33624, 33625, 33626, 33629, 33634, 33635, 33637, 33647, 
+                    33810)
+
+Orange_zip<-c(32703, 32709, 32712, 32751, 32757, 32776, 32789, 32792, 32798, 32801, 
+              32803, 32804, 32805, 32806, 32807, 32808, 32809, 32810, 32811, 32812,
+              32814, 32817, 32818, 32819, 32820, 32821, 32822, 32824, 32825, 32826, 
+              32827, 32828, 32829, 32830, 32831, 32832, 32833, 32835, 32836, 32837, 
+              32839, 34734, 34747, 34760, 34761, 34786, 34787)
+
+Palm_Beach_zip<-c(33401, 33403, 33404, 33405, 33406, 33407, 33408, 33409, 33410, 
+                  33411, 33412, 33413, 33414, 33415, 33417, 33418, 33426, 33428, 
+                  33430, 33431, 33432, 33433, 33434, 33435, 33436, 33437, 33438, 
+                  33440, 33444, 33445, 33446, 33449, 33458, 33460, 33461, 33462, 
+                  33463, 33467, 33469, 33470, 33472, 33473, 33476, 33477, 33478, 
+                  33480, 33483, 33484, 33486, 33487, 33493, 33496, 33498)
+
+```
+
+To filter for district:
+parent_DISTRICT <- d7_filter4 %>%
+  filter(A3 %in% DISTRICT_ZIP)
+  
+#06 Regression
+
+```{r}
+regression_data <- svydesign(ids = ~1, weights = ~weight, data = d7_filter4) 
+
+d12_mod1 <- svyglm(anxiety_binary ~ modality_in_person_1_0 + modality_part_time_1_0 +
+                              gender + worried_covid + as.factor(week_no) + REGION + D8, design=anxiety_design)
+
+```
